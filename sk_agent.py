@@ -1,82 +1,87 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-@Time    : 2023/9/13 12:36
+@Time    : 2023/9/13 12:23
 @Author  : femto Zheng
 @File    : sk_agent.py
+@Modified By: mashenquan, 2023-11-1. In accordance with Chapter 2.2.1 and 2.2.2 of RFC 116, utilize the new message
+        distribution feature for message filtering.
 """
-import asyncio
+from typing import Any, Callable, Union
 
-from semantic_kernel.core_skills import FileIOSkill, MathSkill, TextSkill, TimeSkill
+from pydantic import Field
+from semantic_kernel import Kernel
 from semantic_kernel.planning import SequentialPlanner
-
-# from semantic_kernel.planning import SequentialPlanner
 from semantic_kernel.planning.action_planner.action_planner import ActionPlanner
+from semantic_kernel.planning.basic_planner import BasicPlanner, Plan
 
 from metagpt.actions import UserRequirement
-from metagpt.const import SKILL_DIRECTORY
-from metagpt.roles.sk_agent import SkAgent
+from metagpt.actions.execute_task import ExecuteTask
+from metagpt.logs import logger
+from metagpt.roles import Role
 from metagpt.schema import Message
-from metagpt.tools.search_engine import SkSearchEngine
+from metagpt.utils.make_sk_kernel import make_sk_kernel
 
 
-async def main():
-    # await basic_planner_example()
-    # await action_planner_example()
+class SkAgent(Role):
+    """
+    Represents an SkAgent implemented using semantic kernel
 
-    # await sequential_planner_example()
-    await basic_planner_web_search_example()
+    Attributes:
+        name (str): Name of the SkAgent.
+        profile (str): Role profile, default is 'sk_agent'.
+        goal (str): Goal of the SkAgent.
+        constraints (str): Constraints for the SkAgent.
+    """
 
+    name: str = "Sunshine"
+    profile: str = "sk_agent"
+    goal: str = "Execute task based on passed in task description"
+    constraints: str = ""
 
-async def basic_planner_example():
-    task = """
-    Tomorrow is Valentine's day. I need to come up with a few date ideas. She speaks French so write it in French.
-    Convert the text to uppercase"""
-    role = SkAgent()
+    plan: Plan = Field(default=None, exclude=True)
+    planner_cls: Any = None
+    planner: Union[BasicPlanner, SequentialPlanner, ActionPlanner] = None
+    kernel: Kernel = Field(default_factory=Kernel)
+    import_semantic_skill_from_directory: Callable = Field(default=None, exclude=True)
+    import_skill: Callable = Field(default=None, exclude=True)
 
-    # let's give the agent some skills
-    role.import_semantic_skill_from_directory(SKILL_DIRECTORY, "SummarizeSkill")
-    role.import_semantic_skill_from_directory(SKILL_DIRECTORY, "WriterSkill")
-    role.import_skill(TextSkill(), "TextSkill")
-    # using BasicPlanner
-    await role.run(Message(content=task, cause_by=UserRequirement))
+    def __init__(self, **data: Any) -> None:
+        """Initializes the Engineer role with given attributes."""
+        super().__init__(**data)
+        self.set_actions([ExecuteTask()])
+        self._watch([UserRequirement])
+        self.kernel = make_sk_kernel()
 
+        # how funny the interface is inconsistent
+        if self.planner_cls == BasicPlanner or self.planner_cls is None:
+            self.planner = BasicPlanner()
+        elif self.planner_cls in [SequentialPlanner, ActionPlanner]:
+            self.planner = self.planner_cls(self.kernel)
+        else:
+            raise Exception(f"Unsupported planner of type {self.planner_cls}")
 
-async def sequential_planner_example():
-    task = """
-    Tomorrow is Valentine's day. I need to come up with a few date ideas. She speaks French so write it in French.
-    Convert the text to uppercase"""
-    role = SkAgent(planner_cls=SequentialPlanner)
+        self.import_semantic_skill_from_directory = self.kernel.import_semantic_skill_from_directory
+        self.import_skill = self.kernel.import_skill
 
-    # let's give the agent some skills
-    role.import_semantic_skill_from_directory(SKILL_DIRECTORY, "SummarizeSkill")
-    role.import_semantic_skill_from_directory(SKILL_DIRECTORY, "WriterSkill")
-    role.import_skill(TextSkill(), "TextSkill")
-    # using BasicPlanner
-    await role.run(Message(content=task, cause_by=UserRequirement))
+    async def _think(self) -> None:
+        self._set_state(0)
+        # how funny the interface is inconsistent
+        if isinstance(self.planner, BasicPlanner):
+            self.plan = await self.planner.create_plan_async(self.rc.important_memory[-1].content, self.kernel)
+            logger.info(self.plan.generated_plan)
+        elif any(isinstance(self.planner, cls) for cls in [SequentialPlanner, ActionPlanner]):
+            self.plan = await self.planner.create_plan_async(self.rc.important_memory[-1].content)
 
+    async def _act(self) -> Message:
+        # how funny the interface is inconsistent
+        result = None
+        if isinstance(self.planner, BasicPlanner):
+            result = await self.planner.execute_plan_async(self.plan, self.kernel)
+        elif any(isinstance(self.planner, cls) for cls in [SequentialPlanner, ActionPlanner]):
+            result = (await self.plan.invoke_async()).result
+        logger.info(result)
 
-async def basic_planner_web_search_example():
-    task = """
-    Question: Who made the 1989 comic book, the film version of which Jon Raymond Polito appeared in?"""
-    role = SkAgent()
-
-    role.import_skill(SkSearchEngine(), "WebSearchSkill")
-    # role.import_semantic_skill_from_directory(skills_directory, "QASkill")
-
-    await role.run(Message(content=task, cause_by=UserRequirement))
-
-
-async def action_planner_example():
-    role = SkAgent(planner_cls=ActionPlanner)
-    # let's give the agent 4 skills
-    role.import_skill(MathSkill(), "math")
-    role.import_skill(FileIOSkill(), "fileIO")
-    role.import_skill(TimeSkill(), "time")
-    role.import_skill(TextSkill(), "text")
-    task = "What is the sum of 110 and 990?"
-    await role.run(Message(content=task, cause_by=UserRequirement))  # it will choose mathskill.Add
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        msg = Message(content=result, role=self.profile, cause_by=self.rc.todo)
+        self.rc.memory.add(msg)
+        return msg
